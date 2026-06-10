@@ -1,0 +1,25 @@
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+
+.venv/
+.env
+
+*.h5ad
+
+# Experiment run outputs (timestamped or SLURM job-ID subdirectories)
+outputs/track_a/*/
+outputs/track_b/*/
+outputs/track_c/*/
+outputs/finetuned_model/
+
+# API caches (auto-regenerated at runtime — large and noisy in diffs)
+cache/mygene_cache.json
+cache/string_cache.json
+
+# Downloaded model weights
+*.gguf
+*.safetensors

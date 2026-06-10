@@ -1,0 +1,8 @@
+// Syncthing ignore file — excludes large/generated files from sync
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+mlgenx.egg-info/
+cache/
