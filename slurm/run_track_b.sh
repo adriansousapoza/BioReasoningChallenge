@@ -1,7 +1,11 @@
 #!/bin/bash -l
-# Slurm job: full test.csv run with gpt-oss:120b on LUMI MI250X.
-# 8 GCDs (512 GB VRAM total), OLLAMA_NUM_PARALLEL=4 for throughput.
-# Expected: ~3-4 hours for 1813 test rows.
+# Full test.csv run — vLLM with tensor parallelism across all 8 MI250X GCDs.
+#
+# Prerequisites (run once before submitting):
+#   cd $SCRATCH/code && uv sync --extra serve   # installs vLLM into .venv
+#   huggingface-cli download openai/gpt-oss-120b --local-dir $SCRATCH/model/hf/gpt-oss-120b
+#
+# Expected: ~3-4 hours for 1813 rows at concurrency=32 with full GPU utilisation.
 #SBATCH --job-name=bioreasonB
 #SBATCH --output=/scratch/project_465002610/sousapoz/code/outputs/track_b/%x_%j.out
 #SBATCH --error=/scratch/project_465002610/sousapoz/code/outputs/track_b/%x_%j.err
@@ -18,50 +22,62 @@ set -e
 SCRATCH=/scratch/project_465002610/sousapoz
 CODE=$SCRATCH/code
 OUTPUT=$CODE/outputs/track_b
-OLLAMA=$SCRATCH/bin/bin/ollama
+MODEL=$SCRATCH/model/hf/gpt-oss-120b
 
-source $SCRATCH/venv/bin/activate
-export OLLAMA_MODELS=$SCRATCH/model/ollama
-export OLLAMA_HOST=127.0.0.1:11434
+# Syncthing runs only in a tmux session on the login node — it is NOT present
+# on compute nodes. This kill is a no-op on the compute node but serves as an
+# explicit safeguard in case anything ever starts it here accidentally.
+pkill -x syncthing || true
+
+source $CODE/.venv/bin/activate
+export HF_HOME=$SCRATCH/model/hf
 export BIOREASONDATA=$SCRATCH/data
 export GRN_DATA_DIR=$SCRATCH/data/grn
 export ROCR_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export OLLAMA_NUM_PARALLEL=4       # 4 concurrent inferences on 512 GB VRAM
-export OLLAMA_FLASH_ATTENTION=1
-export PATH=$SCRATCH/bin/bin:$PATH
 mkdir -p $OUTPUT
 
 echo "[$(date)] Node: $(hostname), partition: standard-g, 8 GCDs"
+echo "[$(date)] Starting vLLM (ROCm, tensor-parallel=8)..."
 
-echo "[$(date)] Starting Ollama (ROCm, gfx90a)..."
-$OLLAMA serve &
-OLLAMA_PID=$!
+python -m vllm.entrypoints.openai.api_server \
+    $MODEL \
+    --served-model-name gpt-oss:120b \
+    --tensor-parallel-size 8 \
+    --host 127.0.0.1 \
+    --port 11434 \
+    --dtype auto \
+    --enforce-eager \
+    --no-enable-prefix-caching &
+VLLM_PID=$!
 
+# Wait for vLLM to be ready (health endpoint)
 for i in $(seq 1 120); do
-    $OLLAMA list > /dev/null 2>&1 && echo "[$(date)] Ollama ready (${i}x5s)" && break
+    curl -sf http://127.0.0.1:11434/health > /dev/null 2>&1 \
+        && echo "[$(date)] vLLM ready (${i}x5s)" && break
     sleep 5
-    [ $i -eq 120 ] && echo "ERROR: Ollama timeout" && kill $OLLAMA_PID && exit 1
+    [ $i -eq 120 ] && echo "ERROR: vLLM timeout" && kill $VLLM_PID && exit 1
 done
 
-# Warm up: load model into VRAM before first real request
-echo "[$(date)] Loading model into VRAM..."
+# Warm up: load all tensor-parallel shards into VRAM
+echo "[$(date)] Warming up model across all 8 GCDs..."
 curl -sf http://127.0.0.1:11434/v1/chat/completions \
     -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss:120b","messages":[{"role":"user","content":"Hi"}],"max_tokens":5}' > /dev/null || true
-echo "[$(date)] Model warm. Starting predictions (concurrency=16, num_parallel=4)..."
+    -d '{"model":"gpt-oss:120b","messages":[{"role":"user","content":"Hi"}],"max_tokens":5}' \
+    > /dev/null || true
+echo "[$(date)] Model warm. Starting predictions (concurrency=32)..."
 
 python $CODE/track_b_submit.py \
-    --api-base http://127.0.0.1:11434/v1 \
-    --api-key  ollama \
-    --model    gpt-oss:120b \
-    --model-name openai/gpt-oss-120b \
-    --test-csv $CODE/data/test.csv \
-    --output-dir $OUTPUT \
-    --run-name "${SLURM_JOB_ID}_full" \
-    --concurrency 16 \
-    --max-iters 12 \
+    --api-base    http://127.0.0.1:11434/v1 \
+    --api-key     none \
+    --model       gpt-oss:120b \
+    --model-name  openai/gpt-oss-120b \
+    --test-csv    $CODE/data/test.csv \
+    --output-dir  $OUTPUT \
+    --run-name    "${SLURM_JOB_ID}_full" \
+    --concurrency 32 \
+    --max-iters   12 \
     --reasoning-effort medium \
-    --save-every 50
+    --save-every  50
 
-kill $OLLAMA_PID
-echo "[$(date)] Done. Results at $OUTPUT/submission_track_b.zip"
+kill $VLLM_PID
+echo "[$(date)] Done. Results at $OUTPUT/${SLURM_JOB_ID}_full/"

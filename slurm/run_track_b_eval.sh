@@ -1,7 +1,10 @@
 #!/bin/bash -l
-# Slurm job: 100-row train evaluation on dev_val split.
-# Use dev-g partition for fast queue access.
-# Edit SCRATCH/PROJECT if needed.
+# 100-row train evaluation on dev_val split — vLLM with tensor parallelism.
+# Uses dev-g partition for fast queue access (~30-45 min turnaround).
+#
+# Prerequisites (run once before submitting):
+#   cd $SCRATCH/code && uv sync --extra serve
+#   huggingface-cli download openai/gpt-oss-120b --local-dir $SCRATCH/model/hf/gpt-oss-120b
 #SBATCH --job-name=bioreasonB_eval
 #SBATCH --output=/scratch/project_465002610/sousapoz/code/outputs/track_b/eval_%j.out
 #SBATCH --error=/scratch/project_465002610/sousapoz/code/outputs/track_b/eval_%j.err
@@ -18,46 +21,57 @@ set -e
 SCRATCH=/scratch/project_465002610/sousapoz
 CODE=$SCRATCH/code
 OUTPUT=$CODE/outputs/track_b
-OLLAMA=$SCRATCH/bin/bin/ollama
+MODEL=$SCRATCH/model/hf/gpt-oss-120b
 
-source $SCRATCH/venv/bin/activate
-export OLLAMA_MODELS=$SCRATCH/model/ollama
-export OLLAMA_HOST=127.0.0.1:11434
+pkill -x syncthing || true
+
+source $CODE/.venv/bin/activate
+export HF_HOME=$SCRATCH/model/hf
 export BIOREASONDATA=$SCRATCH/data
 export GRN_DATA_DIR=$SCRATCH/data/grn
 export ROCR_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export PATH=$SCRATCH/bin/bin:$PATH
 mkdir -p $OUTPUT
 
-echo "[$(date)] Node: $(hostname)"
-echo "[$(date)] Starting Ollama (ROCm)..."
-$OLLAMA serve &
-OLLAMA_PID=$!
+echo "[$(date)] Node: $(hostname), starting vLLM (tensor-parallel=8)..."
+
+python -m vllm.entrypoints.openai.api_server \
+    $MODEL \
+    --served-model-name gpt-oss:120b \
+    --tensor-parallel-size 8 \
+    --host 127.0.0.1 \
+    --port 11434 \
+    --dtype auto \
+    --enforce-eager \
+    --no-enable-prefix-caching &
+VLLM_PID=$!
 
 for i in $(seq 1 120); do
-    $OLLAMA list > /dev/null 2>&1 && echo "[$(date)] Ollama ready (${i}x5s)" && break
+    curl -sf http://127.0.0.1:11434/health > /dev/null 2>&1 \
+        && echo "[$(date)] vLLM ready (${i}x5s)" && break
     sleep 5
-    [ $i -eq 120 ] && echo "ERROR: Ollama timeout" && kill $OLLAMA_PID && exit 1
+    [ $i -eq 120 ] && echo "ERROR: vLLM timeout" && kill $VLLM_PID && exit 1
 done
 
-curl -s http://127.0.0.1:11434/api/generate \
-    -d '{"model":"gpt-oss:120b","prompt":"Hi","stream":false,"options":{"num_predict":5}}' > /dev/null
-echo "[$(date)] Model loaded. Running 100-row eval (concurrency=16)..."
+curl -sf http://127.0.0.1:11434/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"gpt-oss:120b","messages":[{"role":"user","content":"Hi"}],"max_tokens":5}' \
+    > /dev/null || true
+echo "[$(date)] Model warm. Running 100-row eval (concurrency=32)..."
 
 python $CODE/track_b_submit.py \
-    --api-base http://127.0.0.1:11434/v1 \
-    --api-key  ollama \
-    --model    gpt-oss:120b \
-    --model-name openai/gpt-oss-120b \
-    --output-dir $OUTPUT \
-    --run-name "${SLURM_JOB_ID}_eval" \
-    --concurrency 16 \
-    --max-iters 12 \
+    --api-base    http://127.0.0.1:11434/v1 \
+    --api-key     none \
+    --model       gpt-oss:120b \
+    --model-name  openai/gpt-oss-120b \
+    --output-dir  $OUTPUT \
+    --run-name    "${SLURM_JOB_ID}_eval" \
+    --concurrency 32 \
+    --max-iters   12 \
     --reasoning-effort medium \
-    --save-every 20 \
+    --save-every  20 \
     --eval-train \
     --rows 100 \
     --clear-cache
 
-kill $OLLAMA_PID
-echo "[$(date)] Done. Check $OUTPUT/"
+kill $VLLM_PID
+echo "[$(date)] Done. Check $OUTPUT/${SLURM_JOB_ID}_eval/"
