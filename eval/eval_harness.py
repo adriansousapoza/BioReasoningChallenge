@@ -35,21 +35,32 @@ TRAIN_CSV = ROOT / "data" / "train.csv"
 
 def make_split(seed: int = 42, val_frac: float = 0.20) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Split train.csv into dev_train / dev_val with disjoint perturbation genes.
-    Tries to also keep target genes disjoint (best-effort greedy).
+    Split train.csv into dev_train / dev_val disjoint on BOTH perturbation AND target genes.
+
+    Perts and genes are partitioned independently (seeded), then we take the
+    doubly-disjoint quadrants:
+      dev_val   = val_perts   × val_genes
+      dev_train = train_perts × train_genes  (no val_genes)
+
+    This matches the real test condition where perts and target genes are both unseen.
     Returns (dev_train, dev_val).
     """
     df = pd.read_csv(TRAIN_CSV)
-    perts = df["pert"].unique().tolist()
     rng = random.Random(seed)
+
+    perts = df["pert"].unique().tolist()
     rng.shuffle(perts)
+    n_val_p  = max(1, int(len(perts) * val_frac))
+    val_perts   = set(perts[:n_val_p])
+    train_perts = set(perts[n_val_p:])
 
-    n_val = max(1, int(len(perts) * val_frac))
-    val_perts = set(perts[:n_val])
-    train_perts = set(perts[n_val:])
+    genes = df["gene"].unique().tolist()
+    rng.shuffle(genes)
+    n_val_g  = max(1, int(len(genes) * val_frac))
+    val_genes = set(genes[:n_val_g])
 
-    dev_train = df[df["pert"].isin(train_perts)].reset_index(drop=True)
-    dev_val   = df[df["pert"].isin(val_perts)].reset_index(drop=True)
+    dev_val   = df[df["pert"].isin(val_perts)   &  df["gene"].isin(val_genes)].reset_index(drop=True)
+    dev_train = df[df["pert"].isin(train_perts)  & ~df["gene"].isin(val_genes)].reset_index(drop=True)
     return dev_train, dev_val
 
 
